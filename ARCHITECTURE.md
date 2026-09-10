@@ -92,7 +92,7 @@ CREATE POLICY seller_owns_size ON listing_sizes
 
 **File**: `backend/middleware/auth.js`, `backend/utils/tokenHelpers.js`
 
-**Unified login**: Google OAuth → Firebase Auth → JWT token → Supabase auth context
+**Unified login**: Google OAuth / Discord OAuth / email+code → backend verifies the provider (or code) directly → `signToken()` issues a custom JWT (`backend/services/auth.js`, `jsonwebtoken`) → client stores it in `sessionStorage` and sends it as a `Bearer` token. There is no Firebase Auth in this chain; Supabase is used only as the data backend (`backend/services/dataBackend.js`), not for authentication.
 
 **JWT payload**:
 ```json
