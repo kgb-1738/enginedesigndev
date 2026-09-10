@@ -12,29 +12,17 @@ This document walks through the most important modules in Boot Bodega, explainin
 
 ```javascript
 scoreQueryAgainstTitle(query, title)
-  // Takes "jordan 1 ix" and "Air Jordan 1 Low"
-  // Returns relevance score 0–1
+  // Returns a relevance score
   // Covers: word matching, form proximity bonus, numeral equivalence
 ```
 
-### Numeral Equivalence Maps
+### Numeral Equivalence
 
-```javascript
-WORD_TO_ARABIC = { ix: 9, x: 10, xi: 11, ... }
-ROMAN_TO_ARABIC = { IX: 9, X: 10, XI: 11, ... }
-ARABIC_TO_WORD = { 9: "nine", 10: "ten", ... }
-```
-
-User queries are normalized: "IX" → 9 → "nine", so search matches all three forms.
+User queries are normalized so that Roman numerals, Arabic numerals, and word forms of the same size (e.g. "IX", "9", "nine") all match — see the code for the current mapping tables.
 
 ### Form Proximity Bonus
 
-```javascript
-formProximity(word1, word2)
-  // Returns 0.12 bonus if words are adjacent in the title
-  // Example: "Air Jordan" scores higher than "Air" ... "Jordan" far apart
-  // Weights the bonus so "IX Low" ranks higher than "Low IX"
-```
+Adjacent-word matches (e.g. "Air Jordan" together) score a small bonus over the same words appearing far apart in the title, weighted so tighter phrase matches rank higher.
 
 ### Why It Matters
 
@@ -63,16 +51,7 @@ publicSize(sizeRow)
 
 ### RLS Policy
 
-```sql
-CREATE POLICY seller_owns_size ON listing_sizes
-  FOR ALL
-  USING (
-    auth.uid() = seller_id OR
-    auth.role() = 'admin'
-  );
-```
-
-This means:
+A row-level security policy restricts access to the owning seller or an admin. This means:
 - Seller can read/write their own sizes
 - Admin can read/write any sizes
 - Regular user queries that bypass the policy will get 0 rows
@@ -99,11 +78,7 @@ Because application logic can have bugs (a forgotten `.filter()`, a race conditi
 
 ### Key Constants
 
-```javascript
-const FAST_SELLER_BUDGET_MS = 4000;     // Total time budget
-const RETAILER_FETCH_CONCURRENCY = 4;  // Parallelism cap
-const LOOSE_FLOOR = 0.35;              // Min relevance threshold
-```
+A total time budget, a parallelism cap on concurrent retailer fetches, and a minimum relevance threshold are all tunable — see the code for current values.
 
 ### Algorithm Outline
 
@@ -118,10 +93,7 @@ const LOOSE_FLOOR = 0.35;              // Min relevance threshold
    d. As each retailer responds, merge into results and re-rank
    e. Stop fetching when timer hits 4s
    
-3. Rank all results by:
-   a. Relevance score (from searchTokens.js)
-   b. Price accuracy (prefer if exact match on user's size)
-   c. Retailer reputation (Nike ranks higher than unknown retailer)
+3. Rank all results by a blend of relevance, price/size accuracy, and retailer reputation
    
 4. Return top N results
 ```
@@ -157,7 +129,7 @@ This prevents displaying "Nike Air Jordan 1" with no price, which is confusing.
 ### Algorithm
 
 ```
-Cron triggers at 9am & 6pm UTC
+Cron triggers on a fixed twice-daily schedule
   ↓
 FOR each watch:
   1. Fetch current prices from all retailers (live API)
@@ -249,7 +221,7 @@ await fetch('https://api.resend.com/emails', {
   method: 'POST',
   headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
   body: JSON.stringify({
-    from: 'noreply@bootega.com',
+    from: 'no-reply@<domain>',
     to: userEmail,
     html: emailHtml,
   }),
@@ -343,27 +315,19 @@ results.sort((a, b) => {
 
 ### Tables
 
-```sql
-search_runtime_metrics
-  query_id, query_text, duration_ms, result_count, mode (fast/full)
-
-click_log
-  user_id, search_id, result_position, listing_id, clicked_at
-
-appearances
-  search_id, result_position, retailer_id, listing_id
-```
+Operational logging tables record per-query timing and result counts, per-click user/listing interactions, and which listings appeared in which search results — see the migrations for the authoritative schema.
 
 ### Metrics Calculated
 
 ```javascript
 getSearchOpsSummary()
-  // Returns {
-  //   uniqueSearches: 1242,
-  //   avgLatency: 620,  // ms
-  //   clickThroughRate: 0.18,  // 18%
-  //   featuredClicks: 87,
-  //   topRetailer: "Nike",
+  // Returns a summary shape like:
+  // {
+  //   uniqueSearches: <n>,
+  //   avgLatency: <ms>,
+  //   clickThroughRate: <fraction>,
+  //   featuredClicks: <n>,
+  //   topRetailer: "<name>",
   // }
 ```
 

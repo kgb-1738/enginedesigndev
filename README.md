@@ -41,10 +41,10 @@ The entire frontend runs without webpack/vite. Each HTML file imports JS modules
 The database enforces privacy via Postgres Row-Level Security policies, not application logic. A seller's `ownerEmail` field is stripped at the application layer (`publicSize()` in `listingSizes.js`), and the database policy ensures a regular user can never query the raw email. Consequence: privacy is trustworthy even if the application code is compromised.
 
 ### 3. Search Tiering
-Retailers can have thousands of listings, and full text search across all of them + seller inventory in under 4 seconds is the constraint. The solution: a `FAST_SELLER_BUDGET_MS = 4000` that queries the fastest retailers first, then fills remaining time budget with slower ones. Incomplete result sets are acceptable if they're ranked well.
+Retailers can have thousands of listings, and full text search across all of them + seller inventory within a tight time budget is the constraint. The solution: a bounded time budget that queries the fastest retailers first, then fills remaining time with slower ones. Incomplete result sets are acceptable if they're ranked well.
 
 ### 4. Honest Metrics for Partners
-The partner platform tracks only what actually happened (`clickCount`), not inflated metrics like fictional conversions. `commissionStatus` defaults to `'Deferred'` — partners know they're not being auto-paid based on unverified events.
+The partner platform tracks only what actually happened (`clickCount`), not inflated metrics like fictional conversions. Commissions stay unconfirmed until conversion is independently verified — partners know they're not being auto-paid based on unverified events.
 
 ## Project Status
 

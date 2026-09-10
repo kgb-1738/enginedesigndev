@@ -92,7 +92,7 @@ Queries all retailers in parallel. First batch returns in ~200ms, final results 
 2. Search for a boot
 3. Click the watch/heart icon on any result
 4. Set a max price in your preferred currency
-5. Every day at 9am & 6pm UTC, a cron job checks for price drops and sends you an email
+5. On a fixed twice-daily schedule, a cron job checks for price drops and sends you an email
 
 **To test locally without waiting**:
 ```bash

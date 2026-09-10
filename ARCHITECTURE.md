@@ -40,14 +40,11 @@ enginedesign/
 **Problem**: Searching 30,000+ retailer listings + seller inventory within a 4-second budget.
 
 **Solution**: Tiered approach
-- **Fast mode**: in-memory index of top retailers (Nike, StockX, etc.), returns results in <500ms
-- **Full mode**: queries remaining retailers concurrently, respects `FAST_SELLER_BUDGET_MS = 4000`
+- **Fast mode**: in-memory index of top retailers (Nike, StockX, etc.), returns results quickly
+- **Full mode**: queries remaining retailers concurrently within a bounded time budget
 - **Tokenization**: `searchTokens.js` converts size queries (IX, 9, nine) to canonical form so Roman/Arabic numeral equivalence works
 
-**Key values**:
-- `RETAILER_FETCH_CONCURRENCY = 4` (parallelism cap)
-- `LOOSE_FLOOR = 0.35` (relevance threshold)
-- `formProximity()` bonus (0.12) for adjacent words in title
+**Key values**: fetch concurrency, a minimum relevance threshold, and a small proximity bonus for adjacent matching words are all tunable constants set empirically — see the code for current values.
 
 ### 2. Watchlist with Price Alerts
 
@@ -64,9 +61,7 @@ enginedesign/
 - Watch matches are ephemeral (deleted after email sent)
 - FX conversion is live via `convertBetween()` utility
 
-**Database**:
-- `watches` table: `user_id`, `product_name`, `max_price_amount`, `max_price_currency`, `created_at`
-- `watch_matches` table: `watch_id`, `retailer_id`, `match_price`, `matched_at`
+**Database**: watches and their matches are stored in RLS-scoped tables keyed to the owning user; match records are ephemeral and deleted once the alert email is sent.
 
 ### 3. Seller Listings & Multi-Size Support
 
@@ -74,17 +69,9 @@ enginedesign/
 
 **Key insight**: A seller can list one boot in multiple sizes, each with its own price and availability. The privacy challenge: seller's email should only be visible to the seller, not to shoppers browsing the public site.
 
-**Solution**: RLS policies
-```sql
--- Sellers can read/write their own sizes
-CREATE POLICY seller_owns_size ON listing_sizes
-  USING (seller_id = auth.uid());
+**Solution**: Row-level security scopes size records to the owning seller (or admin) at the database layer, and only approved, non-owner-identifying fields are ever readable publicly.
 
--- Public can only see sizes where moderation_status = 'Approved'
--- and they never see the ownerEmail field
-```
-
-**Application layer**: `publicSize()` strips `ownerEmail` before returning to non-seller users
+**Application layer**: `publicSize()` strips the owner's contact field before returning to non-seller users
 
 **Deduplication**: `sanitizeCartItems()` in frontend uses Map-based dedup to prevent basket multiply bug
 
@@ -139,11 +126,7 @@ CREATE POLICY seller_owns_size ON listing_sizes
 - Seller applications (funnel)
 - Crawl health (retailer availability, last updated timestamps)
 
-**Data sources**:
-- `search_runtime_metrics` table (query latency, result counts)
-- `click_log` table (user → listing interaction)
-- `search_crawl_runs` table (retailer fetch status)
-- `appearances` table (which listings appeared in which searches)
+**Data sources**: operational logging tables capture search latency/results, user-listing interactions, retailer fetch status, and which listings appeared in which searches.
 
 ### 7. Partner Platform
 
@@ -153,10 +136,7 @@ CREATE POLICY seller_owns_size ON listing_sizes
 - `clickCount` — accurate count of users who clicked a result
 - Commission deferred until conversion is independently verified
 
-**Honest metrics**:
-- `commissionStatus` defaults to `'Deferred'` (no auto-payment)
-- No fabricated conversion events
-- Partner can claim conversion only if they verify it independently
+**Honest metrics**: commissions are not auto-paid — they stay unconfirmed until conversion is independently verified, and no conversion events are fabricated.
 
 ## Mobile & UI Patterns
 
@@ -211,7 +191,7 @@ User types "Jordan 1 Low 9" in search
 ### Watchlist Alert (Cron → Email)
 
 ```
-Daily 9am & 6pm (UTC):
+On a fixed daily schedule:
     Watch cron triggered
          ↓
     Query all active watches
@@ -259,12 +239,7 @@ Seller uploads boot image + sizes + price
 - `RESEND_API_KEY` (transactional email)
 - `GOOGLE_OAUTH_CLIENT_ID / SECRET` (unified auth)
 
-**Migrations**: All 16 SQL files in `supabase/migrations/` must be applied in order. Current schema includes:
-- Users, roles, profiles
-- Listings, images, sizes (with RLS)
-- Watches, watch_matches (user-scoped)
-- Click logs, metrics, crawl tracking
-- Partner platform tables
+**Migrations**: All SQL files in `supabase/migrations/` must be applied in order. Schema covers users/roles, listings and their media, RLS-scoped watches, operational logging, and partner-platform data — see the migrations themselves for the authoritative schema.
 
 ## Testing & Monitoring
 
