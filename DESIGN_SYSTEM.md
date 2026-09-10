@@ -1,3 +1,9 @@
+> **Superseded.** The canonical design system now lives in the app repo
+> at `kgb-1738/enginedesign` → `/DESIGN.md`. Keeping a second copy here,
+> in a different repo than the code it describes, is exactly how this
+> file and the app repo's docs drifted apart before — update `/DESIGN.md`
+> there instead of this file going forward.
+
 # Design System — Boot Bodega UI/UX
 
 Boot Bodega's design is **atmospheric archival streetwear** (Nike Football × StockX × Aimé Leon Dore aesthetic). This guide covers color tokens, typography, and component conventions.
