@@ -2,7 +2,20 @@
 
 _Last updated: 2026-09-30._ This document walks through the most important modules in Boot Bodega, explaining the "why" behind key design decisions. Tunable values (budgets, thresholds, weights, schedules) are intentionally not listed; see the private code for current settings.
 
-**Contents**: 1 Search tokens · 2 Seller privacy · 3 Hybrid search engine · 4 Catalogue freshness · 5 Entity pages and URL permanence · 6 SEO agent · 7 Identity · 8 Email · 9 Payments · 10 Watchlist · 11 Mobile interactions · 12 Admin metrics
+**Contents**
+
+1. Search tokens
+2. Seller privacy
+3. Hybrid search engine
+4. Catalogue freshness
+5. Entity pages and URL permanence
+6. SEO agent
+7. Identity
+8. Email
+9. Payments
+10. Watchlist
+11. Mobile interactions
+12. Admin metrics
 
 ---
 
@@ -166,13 +179,18 @@ retailer_products rows
 
 ### The Permanence Guarantee
 
-A manifest lists every path that has ever passed the gate. A test fails CI if (a) a manifest path stops resolving without a redirect, or (b) a path passes the gate but is not in the manifest. Moving a URL means adding a **single-hop** redirect to the registry; the server refuses to start with a chain or loop, because crawlers abandon long chains and a loop is an outage. Manifest entries are only ever added, never deleted to make a check pass.
+A manifest lists every path that has ever passed the gate. A test fails CI in two cases:
+
+- A manifest path stops resolving and has no redirect.
+- A path passes the gate but is not in the manifest.
+
+To move a URL, add a **single-hop** redirect to the registry. The server refuses to start with a chain or a loop, because crawlers abandon long chains and a loop is an outage. Only add manifest entries. Never delete one to make a check pass.
 
 ---
 
 ## 6. SEO Agent: `scripts/seo-agent/`
 
-**Problem**: SEO vocabulary gaps (a colourway name that would let a title resolve to the right model) are found faster than a person can triage — but an unsupervised agent editing a production site is a liability.
+**Problem**: The agent finds SEO vocabulary gaps faster than a person can triage them. A gap is a colourway name that would let a title resolve to the right model. But an unsupervised agent that edits a production site is a liability.
 
 **Solution**: A loop with one narrow write path and everything else as a proposal.
 
@@ -193,7 +211,14 @@ sync → feedback → health → revert → coverage → weekly → apply
 ### Why It Is Safe
 
 - **One write path**: the GitHub client can only write the curated register; it cannot push to the default branch and never merges.
-- **Layered gates** run on live data before the PR and again on the committed snapshot in a required check: scope, append/revert-only, entry validity, the term must be a name that identifies exactly one model, a residue guard (the alias must fully explain the title it captures), an extraction diff (only unresolved titles may change), URL set unchanged, and the full security suite.
+- **Layered gates** run on live data before the PR, then again on the committed snapshot in a required check:
+  - scope, and append-or-revert-only changes
+  - entry validity
+  - the term must identify exactly one model
+  - a leftover-words guard: the alias must explain every word of the title it captures
+  - an extraction diff: only titles that were unresolved may change
+  - an unchanged URL set
+  - the full security suite
 - **Reversible by construction**: because the indexable URL set never changes, any auto-applied change can be reverted without a redirect.
 - **Learns from outcomes**: measured effect over a window updates priors; a reverted or rejected term is never proposed again; repeated losses pause auto-apply.
 
@@ -209,7 +234,7 @@ sync → feedback → health → revert → coverage → weekly → apply
 - A table maps `(provider, subject)` to the account key.
 - **Linking policy**: a new provider presenting an email that already belongs to an account **never links by itself**. Email is not proof of ownership — a provider can assert an address the user doesn't control, and some let users change it freely. The user must re-authenticate with the owning provider (a short-lived merge challenge), and no session token is issued before that completes.
 - Providers normalise their very different profile payloads into one shape, including whether the provider itself verified the email.
-- Email one-time codes are a first-class path: the code's hash (never the code) is stored, and sends are ledgered without the secret.
+- Email one-time codes are a first-class sign-in path. The server stores only the code's hash, and the send ledger never records the code.
 
 Seller and partner status are approval flags on the same account, re-checked live on privileged requests.
 
@@ -246,7 +271,7 @@ Keys are derived from the business event (for example one per application or per
 
 ### Sender Registry
 
-The From address is decided in exactly one function (config row, then environment, then code default), and one message class is pinned by a database constraint so it can never be sent from the wrong address.
+One function decides the From address: a config row wins, then the environment, then the code default. A database constraint pins one message class to its sender, so it can never go out from the wrong address.
 
 ### Sandbox by Default
 
@@ -285,7 +310,7 @@ sync:     claim capture:<id> → fulfil
 
 **Watch**: a saved boot query, optionally with a maximum price and currency, scoped to the owning account.
 
-**Match bar**: stricter than search. Word order doesn't matter, but every significant token must appear as a whole word in the title — a watch alert that fires on a loose match erodes trust faster than a search result does.
+**Match bar**: stricter than search. Word order doesn't matter, but every significant token must appear as a whole word in the title. A watch alert that fires on a loose match erodes trust faster than a loose search result does.
 
 ### Algorithm
 

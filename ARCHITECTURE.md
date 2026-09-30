@@ -4,7 +4,7 @@ _Last updated: 2026-09-30. Tunable values (thresholds, budgets, weights, schedul
 
 ## System Overview
 
-Boot Bodega is a **discovery product** (not SaaS) — its value comes from surfacing the right football boot from a large external inventory (retailer + seller), not from letting users manage a system they fully control.
+Boot Bodega is a **discovery product**, not SaaS. Its value comes from surfacing the right football boot out of a large external inventory (retailers and sellers). It does not come from letting users manage a system they control.
 
 This distinction drives architectural choices:
 - **Data freshness matters more than feature breadth** — a crawler and a stock checker keep retailer inventory honest
@@ -63,7 +63,7 @@ enginedesign/
 
 - The **server is the only database client**, authenticating with the service role. The browser never initialises a database client.
 - **Every table has Row-Level Security enabled and no policies**, so the database's public API is default-deny. This is a deliberate backstop, not a gap.
-- **Privacy is enforced in the API layer**: helpers such as `publicSize()` remove owner contact fields before any non-owner response, and owner-scoped routes check the verified actor against the listing owner.
+- **The API layer enforces privacy.** Helpers such as `publicSize()` remove owner contact fields before any non-owner response. Owner-scoped routes check the verified actor against the listing owner.
 - Newer migrations also explicitly revoke access from the public roles and grant only the service role; older tables rely on default-deny alone.
 - Adding RLS policies is only appropriate if a client-side access path is ever deliberately introduced.
 
@@ -83,7 +83,7 @@ enginedesign/
 - **Prewarming**: popular queries are derived from the database with abuse-resistant counting, and warm entries are extended without extra retailer fan-out.
 - **Tokenization**: `searchTokens.js` normalises queries (numeral equivalence, stopwords) and scores titles.
 - **Ranking precedence**: featured sellers and boosted partners first, then private sellers, then other partners and retailers; a relevance floor always applies.
-- **Telemetry**: latency, cache and coalescing rates and indexed share are recorded without query text, IP or client id; click provenance is proven with a short-lived server-signed token rather than a client field.
+- **Telemetry**: the server records latency, cache and coalescing rates, and indexed share. It stores no query text, IP or client id. A short-lived, server-signed token proves click provenance; the client cannot set it.
 
 ### 2. Catalogue Freshness Pipeline
 
@@ -99,11 +99,17 @@ A real bug this pipeline found: an oversized filter in a single database request
 
 **Files**: `backend/routes/entityPages.js`, `services/entityCanonical.js`, `entityIndex.js`, `entityData.js`, `seoEntityPages.js`, `sitemapGenerator.js`, `entityRedirects.js`, `services/nomenclature/*`
 
-Pipeline: raw retailer titles → canonical extraction (brand, model, generation, tier, edition) using per-brand registries → an in-memory tree of brands, models and leaves → a **quality gate** (enough distinct listings and sellers; availability rules) → rendered page and sitemap entry.
+Pipeline:
+
+1. Raw retailer titles.
+2. Canonical extraction of brand, model, generation, tier and edition, using per-brand registries.
+3. An in-memory tree of brands, models and leaves.
+4. A **quality gate**: enough distinct listings and sellers, plus availability rules.
+5. A rendered page and a sitemap entry.
 
 - Pages that fall below the gate keep answering with `noindex` and leave the sitemap; they do not 404.
 - Vocabulary comes in layers: standard per-brand nomenclature, then an editions/collaborations register, then a sanitised curated overlay that is display-only and can never create a page or relax the gate.
-- **URL permanence**: a manifest records every path that has ever passed the gate. A retired or moved URL needs a single-hop redirect entry; the server refuses to start with a redirect chain or loop, and CI fails if a manifest path stops resolving or a new gated path is unrecorded.
+- **URL permanence**: a manifest records every path that has ever passed the gate. A retired or moved URL needs a single-hop redirect entry. The server refuses to start if the registry has a redirect chain or loop. CI fails when a manifest path stops resolving, or when a gated path is missing from the manifest.
 - One English site, one URL per boot; no regional URL variants and therefore no `hreflang`.
 
 ### 4. SEO Agent
@@ -112,16 +118,28 @@ Pipeline: raw retailer titles → canonical extraction (brand, model, generation
 
 A daily loop: `sync → feedback → health → revert → coverage → weekly → apply`, ported from an open adaptive SEO-operator design. State lives in Supabase; signals come from Search Console.
 
-- **Auto-applied**: only new agent-authored entries in the curated register, via a pull request that must pass layered gates (scope, append-only, entry validity, the term must name exactly one model, residue guard, extraction diff, URL set unchanged, the full security test suite) and a required GitHub check.
+- **Auto-applied**: only new agent-authored entries in the curated register. Each goes out as a pull request that passes layered gates and a required GitHub check. The gates check:
+  - scope and append-only changes
+  - entry validity
+  - that the term names exactly one model
+  - that the alias explains every word of the titles it captures (the leftover-words guard)
+  - the extraction diff and an unchanged URL set
+  - the full security test suite
 - **Proposed, never applied**: title/meta rewrites, content changes, internal links, new model lines, anything that adds or removes an indexable URL.
-- **Blast radius**: the GitHub client can only write the register path, cannot push to the default branch, and never merges — it asks for auto-merge, which waits for the required checks.
-- **Learning**: each change is measured over a window afterwards; wins, losses and rejections update learned priors, a loss or failed health check queues an automatic revert, and repeated losses pause auto-apply.
+- **Limits**: the GitHub client can write only the register path. It cannot push to the default branch and never merges. It asks for auto-merge, which waits for the required checks.
+- **Learning**: the agent measures each change over a window afterwards. Wins, losses and rejections update its learned priors. A loss or a failed health check queues an automatic revert. Repeated losses pause auto-apply.
 
 ### 5. Identity and Roles
 
 **Files**: `services/identity.js`, `oauthProviders.js`, `emailAuth.js`, `middleware/auth.js`
 
-**Unified identity**: Google OAuth, Discord OAuth or an emailed one-time code → the backend verifies the provider (or code) directly → `signToken()` issues a custom JWT → the client keeps it in `sessionStorage` and sends it as a `Bearer` token. There is no third-party auth service in the chain; the database is used only as a data backend.
+**Unified identity**: a user signs in with Google OAuth, Discord OAuth or an emailed one-time code.
+
+1. The backend verifies the provider (or the code) directly.
+2. `signToken()` issues a custom JWT.
+3. The client keeps the JWT in `sessionStorage` and sends it as a `Bearer` token.
+
+No third-party auth service sits in this chain. The database is only a data backend.
 
 **Account keys**: the historical single-provider user ID became an opaque *account key*. Existing accounts kept theirs; other providers mint `<provider>:<subject>`. A mapping table resolves `(provider, subject)` to the account key.
 
@@ -153,10 +171,19 @@ The claim keeps its historical name, `googleId`, but holds the account key descr
 **Architecture**: No Resend Templates. All emails are code-generated HTML with a shared brand shell, sent through a single function.
 
 With email v2 enabled:
-- **Idempotency ledger**: each send inserts a unique key before calling the provider. A conflict means already sent. Failed or stale rows can be re-claimed, and ledger errors fail open (send, log, report). The same key is forwarded to the provider.
+- **Idempotency ledger**: each send inserts a unique key before it calls the provider.
+  - A conflict means the email already went out.
+  - A retry can re-claim failed or stale rows.
+  - If the ledger itself errors, the email still sends, and the error is logged and reported.
+  - The same key goes to the provider as its own idempotency key.
 - **Sender registry**: the From address is resolved in one place (config row, then environment, then code default), so different message classes come from appropriate senders.
 - **Sandbox by default**: unless mail mode is explicitly `live`, every recipient is rewritten to a sandbox address. Staging therefore cannot email real users.
-- **Flows**: seller approval and rejection, listing submitted and live, applicant acknowledgement, admin alerts (immediate, digested when volume is high), featured and partner-boost activation, payment receipts (only from the verified webhook), double-opt-in newsletter, sign-in codes, and watch digests.
+- **Flows**:
+  - seller approval and rejection; listing submitted and live; applicant acknowledgement
+  - admin alerts (immediate, or digested when volume is high)
+  - featured and partner-boost activation
+  - payment receipts (sent only from the verified webhook)
+  - double-opt-in newsletter, sign-in codes and watch digests
 
 **Why not templates?** Code gives full control over dynamic content (watch matches, seller info, CTA links) and keeps copy changes in version control and tests, including rendered snapshots.
 
@@ -164,13 +191,23 @@ With email v2 enabled:
 
 **Files**: `routes/paypal.js`, `services/paypal.js`, `featuredCampaigns.js`
 
-The webhook verifies PayPal's signature over the raw request body. A `claimOnce` insert into an events table (primary key = atomic claim) dedupes redeliveries by event id and dedupes fulfilment by capture id — the same capture claim is shared by the synchronous capture route, so a payment is fulfilled exactly once no matter which path arrives first. Processing failures release claims and return an error so the provider retries; the synchronous route proceeds if its own claim errors, because the buyer is waiting. Refunds and reversals un-feature the affected listing; refunds that cannot be attributed are logged for manual review.
+The webhook verifies PayPal's signature over the raw request body.
+
+A `claimOnce` insert into an events table acts as the claim, because the primary key makes it atomic. It dedupes redeliveries by event id and fulfilment by capture id. The synchronous capture route shares the same capture claim, so the payment is fulfilled once, whichever path arrives first.
+
+If processing fails, the handler releases its claims and returns an error, so the provider retries. The synchronous route carries on if its own claim errors, because the buyer is waiting.
+
+Refunds and reversals un-feature the affected listing. The server logs refunds it cannot attribute for manual review.
 
 ### 8. Watchlist with Alerts
 
 **Files**: `services/watchService.js`, `watchMatch.js`
 
-A user saves a boot query (optionally with a maximum price and currency). A batch job matches watches against approved seller listings and the retailer index (no live retailer fan-out per watch) using a stricter matching bar than search — every significant token must appear as a whole word. New matches are emailed as a digest. Watches are scoped to their owning account by the API layer; currency conversion uses live rates. This track is localhost-only until soft-launch sign-off.
+A user saves a boot query, optionally with a maximum price and currency. A batch job matches watches against approved seller listings and the retailer index. It makes no live retailer request per watch.
+
+The match bar is stricter than search: every significant token must appear as a whole word. The job emails new matches as a digest. The API layer scopes watches to their owning account, and currency conversion uses live rates.
+
+This track runs on localhost only until soft-launch sign-off.
 
 ### 9. Seller Listings & Multi-Size Support
 
@@ -328,7 +365,7 @@ Seller uploads boot image + sizes + price
 
 ## Testing & Monitoring
 
-**Gates**: one pre-merge command runs the offline security and correctness suite (listing scope, cart identity, search tokens, watch matching, identity resolution, email, newsletter, crawler reconcile/availability, entity pages and the URL manifest, page checker, SEO agent). It runs in CI on every pull request; agent-authored PRs additionally pass a dedicated required check. Playwright covers end-to-end flows.
+**Gates**: one pre-merge command runs the offline security and correctness suite. It covers listing scope, cart identity, search tokens, watch matching, identity, email, newsletter, crawler reconcile and availability, entity pages, the URL manifest, the page checker and the SEO agent. It runs in CI on every pull request. Agent-authored PRs also pass a dedicated required check. Playwright covers end-to-end flows.
 
 **Sentry**: web and crawler initialise separately; crawler failures carry stable fingerprints per retailer.
 

@@ -46,7 +46,7 @@ Boot Bodega uses Supabase (hosted Postgres) as its data backend. The server is t
 
 **Email safety**: leave `EMAIL_MODE` unset (or anything other than `live`) locally. Every email is then rewritten to a sandbox address, so you can't accidentally message real users.
 
-Without Supabase configured, the app can fall back to an in-memory store or a Sheets backend for a demo, but search index, entity pages, crawler and most jobs need the database.
+Without Supabase, the app can fall back to an in-memory store or a Sheets backend for a demo. The search index, entity pages, crawler and most jobs still need the database.
 
 ## 3. Start the Server
 
@@ -124,7 +124,15 @@ npm run test:security   # the offline pre-merge gate; also runs in CI on every P
 npm run test:e2e        # Playwright end-to-end (install browsers first: npm run playwright:install)
 ```
 
-The gate covers listing scope, cart identity, search tokens, watch matching, identity resolution, email and newsletter, crawler reconcile/availability, entity pages and the URL manifest, the page checker, and the SEO agent. Individual suites are available as `test:*` scripts. To explore the SEO agent without any external calls: `npm run seo:agent:dry` (uses a snapshot and fixture data).
+The gate covers:
+
+- listing scope, cart identity, search tokens and watch matching
+- identity resolution, email and newsletter
+- crawler reconcile and availability
+- entity pages and the URL manifest
+- the page checker and the SEO agent
+
+Each suite also runs alone as a `test:*` script. To explore the SEO agent without any external calls, run `npm run seo:agent:dry`. It uses a snapshot and fixture data.
 
 ## 10. Understanding the Code Structure
 

@@ -46,7 +46,11 @@ _Last updated: 2026-09-30._
 The entire frontend runs without webpack/vite. The backend serves CSS + JS as-is. Tradeoff: faster iteration, zero build complexity; no tree-shaking or advanced optimization.
 
 ### 2. Service-Role-Only Data Access, RLS as Backstop
-The browser never talks to the database. Every table has Row-Level Security enabled with **no policies**, which makes the database's public API default-deny; the server is the only client and authenticates with the service role. Privacy is therefore an API-layer responsibility (for example `publicSize()` strips a seller's contact fields), backed by defence in depth: default-deny at the database, explicit revokes on newer tables, and tests that guard the scoping helpers. The earlier design of per-user RLS policies was not adopted; adding policies is only warranted if a client-side access path is ever introduced.
+The browser never talks to the database. Every table has Row-Level Security enabled with **no policies**, so the database's public API denies everything by default. The server is the only client, and it authenticates with the service role.
+
+Privacy is therefore the API layer's job. For example, `publicSize()` strips a seller's contact fields. Three layers back it up: default-deny at the database, explicit revokes on newer tables, and tests that guard the scoping helpers.
+
+The project did not adopt per-user RLS policies. Add policies only if a client-side access path is ever introduced.
 
 ### 3. Index-First Search
 Live-querying every retailer per search does not scale. Retailer catalogues are crawled into an index that each web process keeps warm; searches answer from it immediately and optionally add bounded live lookups. Incomplete but well-ranked results beat complete but slow ones, and stale products never surface.
@@ -54,8 +58,8 @@ Live-querying every retailer per search does not scale. Retailer catalogues are 
 ### 4. Permanent URLs
 A page that has ever been indexable must keep answering. A manifest records every gated URL; moving one requires a single-hop redirect; CI fails otherwise. Thin pages degrade to `noindex` instead of 404.
 
-### 5. Autonomy with a Small Blast Radius
-The SEO agent can change exactly one kind of file through a gated pull request. Its client cannot write anywhere else, cannot push to the main branch and cannot merge; everything else it finds is a proposal for a person.
+### 5. Autonomy With Narrow Permissions
+The SEO agent can change one kind of file, through a gated pull request. Its client cannot write anywhere else, push to the main branch or merge. Everything else it finds is a proposal for a person to decide.
 
 ### 6. Claim Before Act
 Payments and emails first insert a unique key, then act. Redeliveries, retries and double-submits become no-ops. Non-production environments send mail to a sandbox unless explicitly set live.
