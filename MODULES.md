@@ -1,238 +1,313 @@
 # Module Deep-Dives — Key Components Explained
 
-This document walks through the most important modules in Boot Bodega, explaining the "why" behind key design decisions.
+_Last updated: 2026-09-30._ This document walks through the most important modules in Boot Bodega, explaining the "why" behind key design decisions. Tunable values (budgets, thresholds, weights, schedules) are intentionally not listed; see the private code for current settings.
 
-## 1. Search: `backend/utils/searchTokens.js` (151 lines)
+**Contents**: 1 Search tokens · 2 Seller privacy · 3 Hybrid search engine · 4 Catalogue freshness · 5 Entity pages and URL permanence · 6 SEO agent · 7 Identity · 8 Email · 9 Payments · 10 Watchlist · 11 Mobile interactions · 12 Admin metrics
 
-**Problem**: Users search for boots using different size notations. "IX", "9", and "nine" are the same size, but a naive full-text search won't match them.
+---
 
-**Solution**: Tokenize user input into canonical forms before searching.
+## 1. Search: `backend/utils/searchTokens.js`
+
+**Problem**: Users search for boots using different notations. "IX", "9", and "nine" are the same number, but a naive full-text search won't match them.
+
+**Solution**: Tokenize user input into canonical forms before matching and scoring.
 
 ### Key Functions
 
 ```javascript
 scoreQueryAgainstTitle(query, title)
   // Returns a relevance score
-  // Covers: word matching, form proximity bonus, numeral equivalence
+  // Covers: word matching, phrase proximity bonus, numeral equivalence
+matchTokens(...)
+  // Shared tokenization used by search, the index and (with a stricter bar) watches
 ```
 
 ### Numeral Equivalence
 
-User queries are normalized so that Roman numerals, Arabic numerals, and word forms of the same size (e.g. "IX", "9", "nine") all match — see the code for the current mapping tables.
+Roman numerals, Arabic numerals, and word forms of the same number all match — see the code for the mapping tables.
 
 ### Form Proximity Bonus
 
-Adjacent-word matches (e.g. "Air Jordan" together) score a small bonus over the same words appearing far apart in the title, weighted so tighter phrase matches rank higher.
+Adjacent-word matches (e.g. "Predator Elite" together) score a small bonus over the same words far apart in the title, so tighter phrase matches rank higher.
 
 ### Why It Matters
 
-Without this, searching for "jordan 1 9" would return no results if the product is listed as "Air Jordan 1 IX". With it, the search tokenizer converts both to the same canonical form and ranks correctly.
+Without this, a query written one way returns nothing when the product is titled another way. It is pure, dependency-free and heavily unit-tested, which is why the rest of the system can share it.
 
 ---
 
-## 2. Privacy: `backend/services/listingSizes.js` (217 lines)
+## 2. Privacy: `backend/services/listingSizes.js`
 
-**Problem**: A seller lists a boot in multiple sizes. The seller's email should never be visible to a shopper browsing listings.
+**Problem**: A seller lists a boot in multiple sizes. The seller's contact details must never reach a shopper browsing listings.
 
-**Solution**: RLS (Row-Level Security) in the database + application-layer stripping.
+**Solution**: Service-role-only data access, plus explicit application-layer scoping.
 
 ### Key Functions
 
 ```javascript
-actorOwns(userId, sellerId)
-  // Returns true if userId is the seller (or admin)
-  // Used to scope database queries: RLS policy checks this
-  
+actorOwns(actor, ownerEmail)
+  // True if the verified actor owns the listing (admins are handled separately)
+  // Gate for every owner-scoped write
+
 publicSize(sizeRow)
-  // Takes a raw size record with {ownerEmail, ...}
-  // Returns a copy WITHOUT ownerEmail
+  // Takes a raw size record that includes owner contact fields
+  // Returns a copy WITHOUT them
   // Always called before returning size data to non-owner users
 ```
 
-### RLS Policy
+### Layers of Defence
 
-A row-level security policy restricts access to the owning seller or an admin. This means:
-- Seller can read/write their own sizes
-- Admin can read/write any sizes
-- Regular user queries that bypass the policy will get 0 rows
+1. **Database default-deny**: every table has Row-Level Security enabled with no policies, so nothing is readable through the database's public API. Only the server, holding the service role, can query.
+2. **Server scoping**: owner-scoped routes verify the actor before touching a listing; `publicSize()` strips contact fields from anything else.
+3. **Tests**: listing-scope tests are part of the pre-merge gate, so a forgotten strip fails CI rather than leaking in production.
+4. **Frontend** only ever calls public endpoints.
 
-### Defense in Depth
+### Why Not Per-User RLS Policies?
 
-1. **Database** enforces privacy (RLS policy)
-2. **Application** strips sensitive fields (publicSize)
-3. **Frontend** only requests public endpoints (no `/api/seller-email`)
-
-This way, even if the application code has a bug, the database won't leak the email.
-
-### Why Not Just Use Application Logic?
-
-Because application logic can have bugs (a forgotten `.filter()`, a race condition, a typo). Database-level RLS is trustworthy — it's enforced before any row is returned.
+The app is service-role-only end to end; the browser has no database client. Policies keyed to a database session user would guard a path that does not exist, while adding a second place for rules to drift. Default-deny gives the backstop; the API gives the semantics. If a client-side access path is ever introduced, policies become mandatory at that point.
 
 ---
 
-## 3. Search Tiering: `backend/services/searchEngine.js` (1000+ lines)
+## 3. Hybrid Search Engine: `backend/services/searchEngine.js`
 
-**Problem**: Retailers can have thousands of listings each, and fetching all of them takes too long. Users expect results in < 4 seconds.
+**Problem**: Retailers can have thousands of listings each. Live-querying all of them per search is slow, fragile and impolite.
 
-**Solution**: Tiered approach with budget allocation.
-
-### Key Constants
-
-A total time budget, a parallelism cap on concurrent retailer fetches, and a minimum relevance threshold are all tunable — see the code for current values.
+**Solution**: Index first, live second.
 
 ### Algorithm Outline
 
 ```
-1. Check fast in-memory cache (Nike, StockX, Aimé Leon Dore)
-   → returns in < 500ms
-   
-2. If user selected "full mode":
-   a. Start timer
-   b. Query seller listings from Supabase (RLS-filtered)
-   c. Fetch slower retailers in parallel, respecting concurrency cap
-   d. As each retailer responds, merge into results and re-rank
-   e. Stop fetching when timer hits 4s
-   
-3. Rank all results by a blend of relevance, price/size accuracy, and retailer reputation
-   
-4. Return top N results
+1. Crawler keeps a persistent retailer index (retailerProductIndex.js);
+   each web process holds a warm in-memory snapshot, refreshed periodically.
+
+2. mode=fast
+   a. Serve from the shared process cache if present
+   b. Otherwise rank the warm index and add seller inventory within a small
+      enrichment budget
+   → returns quickly with indexed and seller results
+
+3. mode=full
+   a. Coalesce identical in-flight requests (thundering herd protection)
+   b. Perform bounded live retailer lookups with concurrency limits
+   c. Merge indexed fill, re-rank
+   d. Write successful live matches back to the index
+
+4. Circuit breakers per retailer; when enough are open, full search falls
+   back to the local index instead of piling on.
 ```
 
 ### Incomplete Results Are OK
 
-The product philosophy: **incomplete results that are well-ranked are better than complete results that are slow.** If we've only fetched 80% of retailers in 4 seconds, the top results are still useful to the user.
+The product philosophy: **incomplete results that are well-ranked are better than complete results that are slow.**
+
+### Ranking Precedence
+
+Featured sellers and boosted partners lead, then private sellers, then other partners and retailers. A relevance floor always applies so promotion can never surface an irrelevant listing.
 
 ### Null Price Handling
 
-```javascript
-hasRequiredRetailerPrice(retailerItem)
-  // Returns false if price is null or 0
-  // Used at 3 call sites to filter out incomplete data
-```
+Retailer items without a usable price are filtered at every call site. Displaying "Air Jordan 1" with no price is confusing and untrustworthy.
 
-This prevents displaying "Nike Air Jordan 1" with no price, which is confusing.
+### Prewarming
 
----
+`searchPrewarmer.js` derives popular queries from the database (canonical aggregation, per-source caps so one client cannot steer it) and keeps their cache entries warm without re-fetching retailers.
 
-## 4. Watchlist Alerts: `backend/services/watchService.js` (250+ lines)
+### Provenance
 
-**Problem**: Users want to know when a boot drops below their max price. Checking manually is tedious.
-
-**Solution**: Cron job that runs twice daily, checks all watches, and emails results.
-
-### Key Concepts
-
-**Watch**: User sets a boot + max price + currency. Stored in `watches` table.
-
-**Watch Match**: When a boot is found below the user's max price, it's temporarily stored in `watch_matches` table, then deleted after email is sent.
-
-### Algorithm
-
-```
-Cron triggers on a fixed twice-daily schedule
-  ↓
-FOR each watch:
-  1. Fetch current prices from all retailers (live API)
-  2. Query seller listings from Supabase (RLS-filtered)
-  3. For each result:
-     a. Convert price to user's preferred currency (live FX)
-     b. If below user's max_price:
-        → Insert into watch_matches table
-  4. If any matches found:
-     a. Generate watch-digest email (notify.js)
-     b. Send via Resend API
-     c. Log to click_log (for analytics)
-     d. Delete match records
-  5. If no matches:
-     → Silently skip (no "no results" email)
-```
-
-### FX Conversion (Why Live, Not Cached)
-
-```javascript
-convertBetween(amount, fromCurrency, toCurrency)
-  // Always fetches current rate from FX API
-  // Example: "Is €150 < user's $200 max?"
-  // convertBetween(150, 'EUR', 'USD') → 165 USD → yes, it's cheaper
-```
-
-**Never cache FX rates.** Rates change daily, and a stale rate could miss a deal or incorrectly alert a user.
-
-### Email Generation
-
-See `notify.js` section below.
+Every result records where it came from (live, indexed, seller). Click provenance is proven with a short-lived, server-signed token — never a field the client can set — so indexed-versus-live click-through numbers can be trusted.
 
 ---
 
-## 5. Email Templates: `backend/services/notify.js` (659 lines)
+## 4. Catalogue Freshness: `scripts/crawl-retailer-catalogues.js`, `scripts/check-product-pages.js`
 
-**Problem**: Transactional emails (watch alerts, seller onboarding, featured listings) need to be branded, dynamic, and reliable.
+**Problem**: An index is only as good as its freshness. Sold-out or removed products must not appear as available.
 
-**Solution**: Code-generated HTML emails with a shared brand shell.
+**Solution**: A two-stage daily pipeline with measured outcomes.
+
+### Stage 1 — Crawl
+
+- Polite, sequential, per-retailer crawl of each shop's product feed with public-host validation and rate-limit backoff.
+- **Reconciliation**: after a product's sizes are upserted, sizes not seen in this run become out of stock — but *only if every lookup and write for that product succeeded*. A failure returns before reconciling, so an error can never mass-expire stock.
+- **No parseable size ⇒ unavailable** (a deliberate product decision; the cost is that some sizeless-but-buyable items such as accessories are hidden).
+- **Run status**: Succeeded, Partial or Failed, with per-retailer coverage; failures are reported to Sentry with stable fingerprints per retailer and failure kind.
+
+### Stage 2 — Page check
+
+Each fresh product is re-checked against the product page itself, using the platform's own availability feed first and structured data second. Theme "sold out" text is deliberately *not* used — it appears in translation files on in-stock pages. Requests are rate-limited per domain, robots directives are honoured, and a block response halts that retailer for the run. A database trigger promotes a fresh page result over the feed value, so downstream code reads a single `available` flag.
+
+### A Debugging Story
+
+Some retailers reported failing runs for weeks. The obvious theory was retailer-side blocking. Measurement showed the failure was local: a lookup that packed a large list of URLs into one request exceeded header limits. The fix chunks lookups by encoded length and records the error's root cause. **Lesson: log the cause, and measure before blaming the remote side.**
+
+---
+
+## 5. Entity Pages and URL Permanence: `backend/services/entity*.js`, `seoEntityPages.js`, `sitemapGenerator.js`
+
+**Problem**: Turn thousands of messy retailer titles into a small set of stable, high-quality, crawlable pages — without ever breaking a URL search engines have seen.
+
+### Pipeline
+
+```
+retailer_products rows
+   ↓ extractEntity(): brand, model, generation, tier, edition
+     (per-brand registries in services/nomenclature/)
+   ↓ entityIndex: brand → model → leaf tree
+   ↓ entityGate(): enough distinct listings and sellers, availability rules
+   ↓ render page + sitemap entry   (or: hold, or: noindex)
+```
+
+### Design Choices
+
+- **Per-brand vocabularies**: no brand's naming scheme is imposed on another. Tiers are never inferred from missing data — an unlabelled title stays unlabelled.
+- **Layered vocabulary**: standard registry → editions/collaborations register → a sanitised curated overlay. The overlay is display-only: it cannot create a page, and it cannot relax the gate.
+- **Thin pages don't disappear**: below the gate a page answers 200 with `noindex` and leaves the sitemap. Only an unknown path is a 404.
+- **Same title, several sellers**: each copy names its retailer — the only place a seller name is public.
+- **No hreflang**: one English site with one URL per boot.
+
+### The Permanence Guarantee
+
+A manifest lists every path that has ever passed the gate. A test fails CI if (a) a manifest path stops resolving without a redirect, or (b) a path passes the gate but is not in the manifest. Moving a URL means adding a **single-hop** redirect to the registry; the server refuses to start with a chain or loop, because crawlers abandon long chains and a loop is an outage. Manifest entries are only ever added, never deleted to make a check pass.
+
+---
+
+## 6. SEO Agent: `scripts/seo-agent/`
+
+**Problem**: SEO vocabulary gaps (a colourway name that would let a title resolve to the right model) are found faster than a person can triage — but an unsupervised agent editing a production site is a liability.
+
+**Solution**: A loop with one narrow write path and everything else as a proposal.
+
+```
+sync → feedback → health → revert → coverage → weekly → apply
+```
+
+| Step | Purpose |
+|---|---|
+| sync | Track the agent's open PRs; a person closing one counts as a rejection |
+| feedback | Score past changes from Search Console: win / neutral / loss / inconclusive; update learned priors |
+| health | Re-check merged entries against today's catalogue; queue reverts for entries that went bad |
+| revert | One PR that removes queued entries |
+| coverage | Mine the catalogue for gaps, ranked by search demand |
+| weekly | Full analysis and action plan — every action is a proposal for a person |
+| apply | At most one PR of new register entries that pass every gate |
+
+### Why It Is Safe
+
+- **One write path**: the GitHub client can only write the curated register; it cannot push to the default branch and never merges.
+- **Layered gates** run on live data before the PR and again on the committed snapshot in a required check: scope, append/revert-only, entry validity, the term must be a name that identifies exactly one model, a residue guard (the alias must fully explain the title it captures), an extraction diff (only unresolved titles may change), URL set unchanged, and the full security suite.
+- **Reversible by construction**: because the indexable URL set never changes, any auto-applied change can be reverted without a redirect.
+- **Learns from outcomes**: measured effect over a window updates priors; a reverted or rejected term is never proposed again; repeated losses pause auto-apply.
+
+---
+
+## 7. Identity: `backend/services/identity.js`, `oauthProviders.js`, `emailAuth.js`
+
+**Problem**: The app launched with one login provider, and every basket, watch and consent hangs off that provider's user ID. Adding providers must not orphan data or create an account-takeover path.
+
+**Solution**: Treat the legacy ID as an opaque **account key**.
+
+- Existing accounts keep their key verbatim (no data migration). Other providers mint `<provider>:<subject>`.
+- A table maps `(provider, subject)` to the account key.
+- **Linking policy**: a new provider presenting an email that already belongs to an account **never links by itself**. Email is not proof of ownership — a provider can assert an address the user doesn't control, and some let users change it freely. The user must re-authenticate with the owning provider (a short-lived merge challenge), and no session token is issued before that completes.
+- Providers normalise their very different profile payloads into one shape, including whether the provider itself verified the email.
+- Email one-time codes are a first-class path: the code's hash (never the code) is stored, and sends are ledgered without the secret.
+
+Seller and partner status are approval flags on the same account, re-checked live on privileged requests.
+
+---
+
+## 8. Email: `backend/services/notify.js`, `emailSenders.js`
+
+**Problem**: Transactional emails (watch alerts, seller onboarding, featured listings) must be branded, dynamic, and — above all — sent exactly once.
 
 ### Why Not Resend Templates?
 
-Resend's Template feature is designed for static emails with simple variable substitution. Boot Bodega needs:
-- Dynamic loops (watch matches: iterate over 5 boots)
-- Conditional content (if user is a new seller vs. existing)
-- Custom CTAs (links with tracking parameters)
-- A/B testing of copy (requires redeploy, not template edit)
-
-Code generation gives full control.
+Templates suit static emails with simple substitution. Boot Bodega needs dynamic loops (match lists), conditional content, tracked CTAs, and copy that lives in version control with rendered snapshot tests. Code generation gives that.
 
 ### Structure
 
 ```javascript
-brandShell(content)
-  // Wraps content in brand HTML/CSS
-  // Returns complete, sendable email
-  
-notifyWatchDigest(userId, matches)
-  // Generates watch-alert email
-  // Matches = [{boot, price, retailer, url}, ...]
-  
-notifySellerApplication(applicantEmail)
-  // Seller applied to become a seller on Boot Bodega
+brandShell(content)        // Wraps content in brand HTML/CSS
+sendEmail(options)         // The ONLY provider call site; never throws
+notifyWatchDigest(...)     // Watch-alert email
+notifySellerApplication(...)
 ```
 
-### Brand Shell Details
+### Exactly Once (email v2)
 
-```html
-<!DOCTYPE html>
-<html>
-  <body>
-    <!-- Header with logo -->
-    <!-- Content (passed in) -->
-    <!-- Footer: social links, unsubscribe, legal -->
-  </body>
-</html>
-
-<style>
-  /* Fonts: Josefin Sans, Plus Jakarta Sans, DM Mono */
-  /* Colors: #0A0A0A bg, #FF000D coral CTA */
-  /* Line-height 1.5, generous padding */
-</style>
+```
+sendEmail({ idempotencyKey, templateKey, senderKey, ... })
+  1. INSERT key into the send ledger      → unique conflict = already sent, stop
+  2. Call the provider, forwarding the same key as its own idempotency header
+  3. Mark sent / failed; failed or stale-queued rows can be re-claimed by a retry
+  * Ledger errors fail open: send anyway, log, report to Sentry
 ```
 
-### Sending
+Keys are derived from the business event (for example one per application or per payment capture), so double-clicks, retries and webhook redeliveries collapse into one email.
 
-```javascript
-await fetch('https://api.resend.com/emails', {
-  method: 'POST',
-  headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
-  body: JSON.stringify({
-    from: 'no-reply@<domain>',
-    to: userEmail,
-    html: emailHtml,
-  }),
-});
-```
+### Sender Registry
 
-**Important**: Resend domain must be verified and in Production mode, not Sandbox.
+The From address is decided in exactly one function (config row, then environment, then code default), and one message class is pinned by a database constraint so it can never be sent from the wrong address.
+
+### Sandbox by Default
+
+Unless the mail mode is explicitly `live`, every recipient is rewritten to a sandbox address and the subject is tagged. This applies even with the ledger disabled, and ledger keys are namespaced so a staging send can never suppress a production one. **Production must set the mail mode to live, or all mail — including sign-in codes — goes to the sandbox.**
+
+**Important**: the provider domain must be verified and in production mode.
 
 ---
 
-## 6. Mobile Interactions: `frontend/js/app.js` (6400+ lines)
+## 9. Payments: `backend/routes/paypal.js`, `backend/services/paypal.js`
+
+**Problem**: Money events arrive from two directions — the buyer's browser (synchronous capture) and PayPal's servers (webhook) — in any order, possibly repeated, possibly forged.
+
+**Solution**: Verify, claim once, then act.
+
+```
+webhook:  verify signature over the RAW body
+          → claim event:<id>        (dedupe redelivery)
+          → claim capture:<id>      (shared with the sync route)
+          → fulfil only if the claim succeeded
+sync:     claim capture:<id> → fulfil
+```
+
+- The claim is an `INSERT` into an events table whose primary key makes it atomic.
+- On processing failure the handler **releases its claims and returns an error** so the provider retries. If the *event* claim itself errors it also returns an error. The sync route instead proceeds if its claim errors, because the buyer is waiting.
+- Refunds and reversals un-feature the listing via the order's custom id; refunds that can't be attributed are logged for manual review.
+- Fulfilment functions are not idempotent on their own — **never call them without the claim.**
+
+---
+
+## 10. Watchlist Alerts: `backend/services/watchService.js`, `watchMatch.js`
+
+**Problem**: Users want to know when a boot they care about appears (optionally below a price). Checking manually is tedious.
+
+### Key Concepts
+
+**Watch**: a saved boot query, optionally with a maximum price and currency, scoped to the owning account.
+
+**Match bar**: stricter than search. Word order doesn't matter, but every significant token must appear as a whole word in the title — a watch alert that fires on a loose match erodes trust faster than a search result does.
+
+### Algorithm
+
+```
+Batch job (or per-watch "check now")
+  FOR each active watch:
+    1. Match approved seller listings (size- and country-aware)
+    2. Match the retailer index (no live retailer fan-out per watch)
+    3. Convert prices with live FX; keep matches under the user's cap
+  IF new matches: send one digest email, record so they aren't re-sent
+  IF none: stay silent (no "no results" email)
+```
+
+### FX Conversion (Why Live, Not Cached)
+
+`convertBetween(amount, from, to)` uses current rates. A stale rate can miss a deal or alert incorrectly. Never cache FX rates beyond the short window the currency service already manages.
+
+Status: localhost-only until soft-launch sign-off.
+
+---
+
+## 11. Mobile Interactions: `frontend/js/app.js`
 
 ### Pinch-to-Zoom on Images
 
@@ -240,7 +315,7 @@ await fetch('https://api.resend.com/emails', {
 
 **Problem**: Shoe images are small. Users want to inspect details.
 
-**Solution**: Pointer Events API for cross-device support (touch + mouse + stylus).
+**Solution**: Pointer Events for cross-device support (touch + mouse + stylus).
 
 ```javascript
 const startDistance = Math.hypot(
@@ -250,22 +325,19 @@ const startDistance = Math.hypot(
 const currentDistance = Math.hypot(...);
 const scale = currentDistance / startDistance;
 
-// Clamp between 1x and 4x
-this.scale = Math.max(1, Math.min(4, scale));
+// Clamp to a sensible min/max
+this.scale = clamp(scale, MIN_SCALE, MAX_SCALE);
 ```
 
-**Why Pointer Events, not Touch Events?**
-- Touch Events are mobile-only
-- Pointer Events work on touch, mouse, and stylus (future-proofing)
-- Easier to track multi-pointer gestures (pinch is 2 pointers)
+**Why Pointer Events, not Touch Events?** Touch Events are mobile-only; Pointer Events cover touch, mouse and stylus and make multi-pointer gestures (pinch = 2 pointers) easier to track.
 
 ### Mobile Dock Visibility
 
 **File**: `frontend/js/app.js:initDockPin()` and `frontend/css/app.css`
 
-**Problem**: When the mobile keyboard opens, it shrinks `window.innerHeight`, pushing the dock off-screen.
+**Problem**: When the mobile keyboard opens, it can push the bottom dock off-screen.
 
-**Solution**: Use `visualViewport` API to detect keyboard height.
+**Solution**: `visualViewport`.
 
 ```javascript
 visualViewport.addEventListener('resize', () => {
@@ -275,75 +347,54 @@ visualViewport.addEventListener('resize', () => {
 });
 ```
 
-**Why not `window.innerHeight`?**
-`window.innerHeight` includes the keyboard height in some browsers. `visualViewport.height` is the actual visible area, so the delta is the keyboard height.
+`window.innerHeight` may include the keyboard in some browsers; `visualViewport.height` is the actual visible area.
 
 ### Sort by Price (Proximity to Midpoint)
 
 **File**: `frontend/js/app.js:sortCards()`
 
-**Problem**: Sorting by "price: low to high" spreads results across a wide range. Better UX: group similar prices together.
+**Problem**: "Low to high" spreads results across a wide range.
 
-**Solution**: Rank by proximity to the price range midpoint.
+**Solution**: rank by proximity to the midpoint of the visible price range so similarly priced options cluster.
 
 ```javascript
-const minPrice = parseFloat(document.querySelector('[name="price-min"]').value);
-const maxPrice = parseFloat(document.querySelector('[name="price-max"]').value);
 const midpoint = (minPrice + maxPrice) / 2;
-
-results.sort((a, b) => {
-  const distA = Math.abs(a.price - midpoint);
-  const distB = Math.abs(b.price - midpoint);
-  return distA - distB;  // Closer to midpoint comes first
-});
+results.sort((a, b) => Math.abs(a.price - midpoint) - Math.abs(b.price - midpoint));
 ```
 
-**Example**: Price range $150–$200, midpoint $175
-- $140 (distance: 35) ← not shown, below range
-- $170 (distance: 5) ← top
-- $175 (distance: 0) ← top
-- $190 (distance: 15) ← middle
-- $210 (distance: 35) ← not shown, above range
+### Basket De-duplication
+
+`sanitizeCartItems()` normalises stored basket items by a stable identity key so the same boot is never duplicated by re-adds or stale storage.
 
 ---
 
-## 7. Admin Metrics: `backend/services/searchOps.js`
+## 12. Admin Metrics: `backend/services/searchOps.js`
 
-**Problem**: How do we know if the search engine is working? How many users searched today? What's the CTR?
+**Problem**: How do we know the search engine is healthy and useful?
 
-**Solution**: Log every search and click, query the logs to generate 24h rolling metrics.
+**Solution**: Persist privacy-minimised runtime metrics and derive rolling views.
 
-### Tables
+- Search latency percentiles for fast and full modes, cache and coalescing rates, indexed share, unavailable and error rates
+- Click-through by result source, using verified provenance
+- Latest crawl run: status, retailers succeeded and failed, products processed, index freshness
 
-Operational logging tables record per-query timing and result counts, per-click user/listing interactions, and which listings appeared in which search results — see the migrations for the authoritative schema.
-
-### Metrics Calculated
-
-```javascript
-getSearchOpsSummary()
-  // Returns a summary shape like:
-  // {
-  //   uniqueSearches: <n>,
-  //   avgLatency: <ms>,
-  //   clickThroughRate: <fraction>,
-  //   featuredClicks: <n>,
-  //   topRetailer: "<name>",
-  // }
-```
-
-This powers the admin dashboard.
+No query text, IP address or client id is stored in the runtime metric rows.
 
 ---
 
 ## Conclusion
 
-Each of these modules solves a specific problem at a different layer:
+Each module solves a specific problem at a different layer:
 
 - **searchTokens**: user input → canonical form
-- **searchEngine**: search query → fast results
+- **searchEngine + index**: query → fast, well-ranked results
+- **crawler + page check**: retailer sites → trustworthy availability
+- **entity pipeline**: messy titles → stable, gated, permanent pages
+- **seo-agent**: search signals → tightly scoped, reversible improvements
+- **identity**: many providers → one safe account key
 - **listingSizes**: seller data → privacy-respecting public data
-- **watchService**: scheduled check → user alert
-- **notify**: event → branded email
+- **notify + paypal**: events → exactly-once email and fulfilment
+- **watchService**: saved query → user alert
 - **frontend app.js**: user gesture → responsive UI
 
 Understanding these modules is the key to extending Boot Bodega or building similar systems.
